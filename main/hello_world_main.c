@@ -140,6 +140,9 @@ int rc = lsm6dsv16x_flag_data_ready_get(&dev_ctx, &drdy_flags);
                      ax, ay, az, gx, gy, gz,
                      roll*RAD_TO_DEG, pitch*RAD_TO_DEG, yaw*RAD_TO_DEG);
         }
+        lsm6dsv16x_all_sources_t all_sources;
+        lsm6dsv16x_all_sources_get(&dev_ctx, &all_sources); 
+        // Reading this register clears the hardware INT pin so it can pulse again.
     }
 }
 
