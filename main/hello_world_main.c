@@ -135,8 +135,8 @@ static void imu_task(void *arg) {
 void app_main(void) {
     // I2C configuration - adjust pins to your board wiring if needed
     const i2c_port_t I2C_NUM = I2C_NUM_0;
-    const gpio_num_t SDA_PIN = GPIO_NUM_21;
-    const gpio_num_t SCL_PIN = GPIO_NUM_22;
+    const gpio_num_t SDA_PIN = GPIO_NUM_8;
+    const gpio_num_t SCL_PIN = GPIO_NUM_9;
 
     i2c_config_t i2c_conf = {
         .mode = I2C_MODE_MASTER,
