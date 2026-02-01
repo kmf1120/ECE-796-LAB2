@@ -151,7 +151,7 @@ void app_main(void) {
 
     // prepare device context for ST driver
     lsm_handle.i2c_num = I2C_NUM;
-    lsm_handle.i2c_addr = (uint8_t)(LSM6DSV16X_I2C_ADD_L >> 1); // convert 8-bit to 7-bit
+    lsm_handle.i2c_addr = (uint8_t)(LSM6DSV16X_I2C_ADD_H >> 1); // This results in 0x6B
 
     dev_ctx.write_reg = platform_write;
     dev_ctx.read_reg = platform_read;
