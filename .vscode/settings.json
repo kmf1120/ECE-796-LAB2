@@ -14,5 +14,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Kieran\\Lab2\\build"
-  ]
+  ],
+  "idf.portWin": "COM4",
+  "idf.flashType": "UART"
 }

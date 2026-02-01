@@ -1,3 +1,4 @@
+#include "sdkconfig.h" // <--- Add this first!
 #include <stdio.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
@@ -26,7 +27,8 @@ static int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp, ui
     if (len + 1 > sizeof(data)) return -1;
     data[0] = reg;
     memcpy(&data[1], bufp, len);
-    esp_err_t err = i2c_master_write_to_device(h->i2c_num, h->i2c_addr, data, len + 1, pdMS_TO_TICKS(1000));
+    // Use pdMS_TO_TICKS directly
+    esp_err_t err = i2c_master_write_to_device(h->i2c_num, h->i2c_addr, data, len + 1, pdMS_TO_TICKS(100));
     return (err == ESP_OK) ? 0 : -1;
 }
 
@@ -191,8 +193,8 @@ void app_main(void) {
     // Setup ESP GPIO for INT pin and queue to capture timestamps in ISR
     drdy_queue = xQueueCreate(10, sizeof(int64_t));
     gpio_config_t io_conf = {
-        .intr_type = GPIO_PIN_INTR_POSEDGE,
-        .pin_bit_mask = (1ULL<<GPIO_NUM_4), // INT pin - adjust to your wiring
+        .intr_type = GPIO_INTR_POSEDGE, // <--- Fixed name (removed _PIN_)
+        .pin_bit_mask = (1ULL << GPIO_NUM_4),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
