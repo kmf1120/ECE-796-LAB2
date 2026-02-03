@@ -97,7 +97,6 @@ static void quaternion_to_euler(float q0, float q1, float q2, float q3,
     
     // Pitch (Y-axis rotation)
     float sinp = 2.0f * (q0 * q2 - q3 * q1);
-    // Clamp to avoid numerical issues with asin
     sinp = fmaxf(-1.0f, fminf(1.0f, sinp));
     *pitch = asinf(sinp) * RAD_TO_DEG;
     
@@ -121,12 +120,14 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
 static void imu_task(void *arg) {
     int64_t ts;
     uint32_t print_counter = 0;
+    uint32_t timeout_counter = 0;
     
-    ESP_LOGI(TAG, "IMU task started - collecting data at 120Hz...\n");
+    ESP_LOGI(TAG, "IMU task started - waiting for interrupts...\n");
     
     for (;;) {
-        // Wait for interrupt (data ready from gyroscope)
-        if (xQueueReceive(drdy_queue, &ts, portMAX_DELAY) == pdTRUE) {
+        // Wait for interrupt with 2 second timeout for debugging
+        if (xQueueReceive(drdy_queue, &ts, pdMS_TO_TICKS(2000)) == pdTRUE) {
+            timeout_counter = 0; // Reset timeout counter
             
             uint32_t idx = sample_index;
             imu_sample_t *sample = &sample_buffer[idx];
@@ -219,6 +220,31 @@ static void imu_task(void *arg) {
             // Clear interrupt by reading all_sources register
             lsm6dsv16x_all_sources_t all_sources;
             lsm6dsv16x_all_sources_get(&dev_ctx, &all_sources);
+            
+        } else {
+            // Timeout - no interrupt received
+            timeout_counter++;
+            ESP_LOGW(TAG, "No interrupt for 2 seconds (timeout #%u)", timeout_counter);
+            
+            // Check GPIO pin level
+            int gpio_level = gpio_get_level(GPIO_NUM_4);
+            ESP_LOGI(TAG, "  GPIO4 level: %d", gpio_level);
+            
+            // Check data ready flags
+            lsm6dsv16x_all_sources_t status;
+            if (lsm6dsv16x_all_sources_get(&dev_ctx, &status) == 0) {
+                ESP_LOGI(TAG, "  DRDY status: xl=%d, gy=%d", status.drdy_xl, status.drdy_gy);
+            }
+            
+            // Try reading data anyway (polling mode as fallback)
+            ESP_LOGI(TAG, "  Attempting manual read...");
+            int16_t raw_acc[3], raw_gyro[3];
+            if (lsm6dsv16x_acceleration_raw_get(&dev_ctx, raw_acc) == 0 &&
+                lsm6dsv16x_angular_rate_raw_get(&dev_ctx, raw_gyro) == 0) {
+                ESP_LOGI(TAG, "  Manual read OK: acc=[%d,%d,%d] gyro=[%d,%d,%d]",
+                         raw_acc[0], raw_acc[1], raw_acc[2],
+                         raw_gyro[0], raw_gyro[1], raw_gyro[2]);
+            }
         }
     }
 }
@@ -370,36 +396,56 @@ void app_main(void) {
     rc = lsm6dsv16x_fifo_mode_set(&dev_ctx, LSM6DSV16X_STREAM_MODE);
     ESP_LOGI(TAG, "✓ FIFO stream mode: rc=%d", (int)rc);
     
-    // Route gyro data-ready to INT1 pin
-    lsm6dsv16x_pin_int_route_t int_route;
-    memset(&int_route, 0, sizeof(int_route));
-    int_route.drdy_g = 1;  // Gyro data ready on INT1
-    rc = lsm6dsv16x_pin_int1_route_set(&dev_ctx, &int_route);
-    ESP_LOGI(TAG, "✓ INT1 route configured: rc=%d", (int)rc);
-    
-    ESP_LOGI(TAG, "Configuration complete!\n");
-    
-    // Setup GPIO interrupt for INT1 pin
+    // Setup GPIO interrupt BEFORE routing interrupts
     ESP_LOGI(TAG, "Configuring INT1 interrupt (GPIO%d)...", INT_PIN);
-    drdy_queue = xQueueCreate(10, sizeof(int64_t));
+    drdy_queue = xQueueCreate(20, sizeof(int64_t)); // Larger queue
     
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_POSEDGE,  // Trigger on rising edge
+        .intr_type = GPIO_INTR_POSEDGE,  // INT1 is active high
         .pin_bit_mask = (1ULL << INT_PIN),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,  // Pull down when inactive
     };
     gpio_config(&io_conf);
     gpio_install_isr_service(0);
     gpio_isr_handler_add(INT_PIN, gpio_isr_handler, NULL);
-    ESP_LOGI(TAG, "✓ Interrupt configured\n");
+    ESP_LOGI(TAG, "✓ GPIO interrupt configured");
+    
+    // Check initial GPIO state
+    int gpio_level = gpio_get_level(INT_PIN);
+    ESP_LOGI(TAG, "  Initial GPIO%d level: %d", INT_PIN, gpio_level);
+    
+    // Route gyro data-ready to INT1 pin - THIS MUST BE LAST
+    lsm6dsv16x_pin_int_route_t int_route;
+    memset(&int_route, 0, sizeof(int_route));
+    int_route.drdy_g = 1;  // Gyro data ready on INT1
+    int_route.drdy_xl = 1; // Also route accel (optional, for debugging)
+    rc = lsm6dsv16x_pin_int1_route_set(&dev_ctx, &int_route);
+    ESP_LOGI(TAG, "✓ INT1 route configured: rc=%d", (int)rc);
+    
+    // Verify routing was set
+    lsm6dsv16x_pin_int_route_t verify_route;
+    lsm6dsv16x_pin_int1_route_get(&dev_ctx, &verify_route);
+    ESP_LOGI(TAG, "  Verified INT1 routing: drdy_g=%d, drdy_xl=%d", 
+             verify_route.drdy_g, verify_route.drdy_xl);
+    
+    ESP_LOGI(TAG, "Configuration complete!\n");
     
     // Give sensor time to stabilize
     ESP_LOGI(TAG, "Waiting for sensor to stabilize...");
     platform_delay(200);
-    ESP_LOGI(TAG, "✓ Sensor ready\n");
-
+    
+    // Check GPIO level after stabilization
+    gpio_level = gpio_get_level(INT_PIN);
+    ESP_LOGI(TAG, "  Post-stabilization GPIO%d level: %d\n", INT_PIN, gpio_level);
+    
+    // Check if data is ready
+    lsm6dsv16x_all_sources_t status;
+    if (lsm6dsv16x_all_sources_get(&dev_ctx, &status) == 0) {
+        ESP_LOGI(TAG, "Initial DRDY status: xl=%d, gy=%d\n", status.drdy_xl, status.drdy_gy);
+    }
+    
     ESP_LOGI(TAG, "Starting 120Hz interrupt-driven data acquisition...");
     ESP_LOGI(TAG, "Printing every 1 second (120 samples)\n");
     
