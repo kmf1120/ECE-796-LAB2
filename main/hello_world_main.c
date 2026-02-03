@@ -1,4 +1,4 @@
-#include "sdkconfig.h" // <--- Add this first!
+#include "sdkconfig.h"
 #include <stdio.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
@@ -8,7 +8,7 @@
 #include "driver/i2c.h"
 #include "esp_timer.h"
 #include "esp_log.h"
-#include "lsm6dsv16x_reg.h" // ST driver header included from components/lsm6dsv16x
+#include "lsm6dsv16x_reg.h"
 #include <string.h>
 #include <math.h>
 
@@ -21,6 +21,22 @@ typedef struct {
     uint8_t i2c_addr; /* 7-bit */
 } lsm6dsv16x_handle_t;
 static lsm6dsv16x_handle_t lsm_handle;
+
+/* Data structure for IMU samples */
+typedef struct {
+    int64_t timestamp_us;     // ESP32 timestamp in microseconds
+    float ax, ay, az;         // Acceleration in m/s²
+    float gx, gy, gz;         // Angular velocity in dps
+    float q0, q1, q2, q3;     // Quaternion (w, x, y, z)
+    float roll, pitch, yaw;   // Euler angles in degrees
+} imu_sample_t;
+
+#define SAMPLE_BUFFER_SIZE 120  // Store 1 second of data at 120Hz
+static imu_sample_t sample_buffer[SAMPLE_BUFFER_SIZE];
+static volatile uint32_t sample_index = 0;
+static volatile uint64_t total_samples = 0;
+
+static QueueHandle_t drdy_queue;
 
 static int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp, uint16_t len)
 {
@@ -44,111 +60,173 @@ static void platform_delay(uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
-// Helper: parse SFLP rotation vector from FIFO 6 bytes -> qx,qy,qz (assumes 3x int16)
-static void decode_sflp_rotation_vector(const uint8_t data[6], float *q0, float *q1, float *q2, float *q3)
+// Helper: Decode SFLP rotation vector from FIFO (6 bytes -> quaternion)
+static void decode_sflp_quaternion(const uint8_t data[6], float *q0, float *q1, float *q2, float *q3)
 {
+    // SFLP game rotation vector contains qx, qy, qz as int16_t
     int16_t qx = (int16_t)((data[1] << 8) | data[0]);
     int16_t qy = (int16_t)((data[3] << 8) | data[2]);
     int16_t qz = (int16_t)((data[5] << 8) | data[4]);
-    /* conservative Q-scale; adjust per datasheet if needed */
+    
+    // Scale factor for quaternion (typically 2^14 = 16384)
     const float Q_SCALE = 16384.0f;
     float x = qx / Q_SCALE;
     float y = qy / Q_SCALE;
     float z = qz / Q_SCALE;
+    
+    // Calculate w from normalization constraint: w² + x² + y² + z² = 1
     float w_sq = 1.0f - (x * x + y * y + z * z);
     float w = (w_sq > 0.0f) ? sqrtf(w_sq) : 0.0f;
-    *q0 = w; *q1 = x; *q2 = y; *q3 = z;
+    
+    *q0 = w;  // Scalar part
+    *q1 = x;  // Vector i
+    *q2 = y;  // Vector j
+    *q3 = z;  // Vector k
 }
 
-static QueueHandle_t drdy_queue;
+// Convert quaternion to Euler angles (ZYX convention)
+static void quaternion_to_euler(float q0, float q1, float q2, float q3, 
+                                float *roll, float *pitch, float *yaw)
+{
+    const float RAD_TO_DEG = 57.29577951308232f;
+    
+    // Roll (X-axis rotation)
+    float sinr_cosp = 2.0f * (q0 * q1 + q2 * q3);
+    float cosr_cosp = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
+    *roll = atan2f(sinr_cosp, cosr_cosp) * RAD_TO_DEG;
+    
+    // Pitch (Y-axis rotation)
+    float sinp = 2.0f * (q0 * q2 - q3 * q1);
+    // Clamp to avoid numerical issues with asin
+    sinp = fmaxf(-1.0f, fminf(1.0f, sinp));
+    *pitch = asinf(sinp) * RAD_TO_DEG;
+    
+    // Yaw (Z-axis rotation)
+    float siny_cosp = 2.0f * (q0 * q3 + q1 * q2);
+    float cosy_cosp = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
+    *yaw = atan2f(siny_cosp, cosy_cosp) * RAD_TO_DEG;
+}
 
+// GPIO interrupt handler - triggers on gyro data ready
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
-    int64_t ts = esp_timer_get_time(); // microseconds
+    int64_t ts = esp_timer_get_time(); // Capture timestamp immediately
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xQueueSendFromISR(drdy_queue, &ts, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
 }
 
+// IMU task: reads data at 120Hz, prints at 1Hz
 static void imu_task(void *arg) {
     int64_t ts;
-    uint64_t sample_cnt = 0;
+    uint32_t print_counter = 0;
+    
+    ESP_LOGI(TAG, "IMU task started - collecting data at 120Hz...\n");
+    
     for (;;) {
+        // Wait for interrupt (data ready from gyroscope)
         if (xQueueReceive(drdy_queue, &ts, portMAX_DELAY) == pdTRUE) {
-            sample_cnt++;
-
-            // Check DRDY flags and pin level for diagnosis
-            lsm6dsv16x_data_ready_t drdy_flags; // Use the struct instead of uint8_t
-int rc = lsm6dsv16x_flag_data_ready_get(&dev_ctx, &drdy_flags);
-            int gpio_level = gpio_get_level(GPIO_NUM_4);
-            if (rc == 0) {
-                ESP_LOGI(TAG, "INT fired #%llu ts=%lld us gpio=%d drdy_gyro=%d",
-                        sample_cnt, ts, gpio_level, drdy_flags.drdy_gy);
-            } //else {
-                //ESP_LOGI(TAG, "INT fired #%llu ts=%lld us gpio=%d drdy_flags read err rc=%d",
-                         //sample_cnt, ts, gpio_level, rc);
-            //}
-
-            // Read accel and gyro raw
-            int16_t raw_acc[3] = {0}, raw_g[3] = {0};
-            float ax=0, ay=0, az=0;
-            float gx=0, gy=0, gz=0;
-            float q0=1, q1=0, q2=0, q3=0;
-
+            
+            uint32_t idx = sample_index;
+            imu_sample_t *sample = &sample_buffer[idx];
+            
+            // Store timestamp
+            sample->timestamp_us = ts;
+            
+            // Read accelerometer
+            int16_t raw_acc[3] = {0};
             if (lsm6dsv16x_acceleration_raw_get(&dev_ctx, raw_acc) == 0) {
                 float ax_mg = lsm6dsv16x_from_fs4_to_mg(raw_acc[0]);
                 float ay_mg = lsm6dsv16x_from_fs4_to_mg(raw_acc[1]);
                 float az_mg = lsm6dsv16x_from_fs4_to_mg(raw_acc[2]);
                 const float MG_TO_MS2 = 9.80665e-3f;
-                ax = ax_mg * MG_TO_MS2;
-                ay = ay_mg * MG_TO_MS2;
-                az = az_mg * MG_TO_MS2;
+                sample->ax = ax_mg * MG_TO_MS2;
+                sample->ay = ay_mg * MG_TO_MS2;
+                sample->az = az_mg * MG_TO_MS2;
             }
-
-            if (lsm6dsv16x_angular_rate_raw_get(&dev_ctx, raw_g) == 0) {
-                float gx_mdps = lsm6dsv16x_from_fs1000_to_mdps(raw_g[0]);
-                float gy_mdps = lsm6dsv16x_from_fs1000_to_mdps(raw_g[1]);
-                float gz_mdps = lsm6dsv16x_from_fs1000_to_mdps(raw_g[2]);
-                gx = gx_mdps / 1000.0f;
-                gy = gy_mdps / 1000.0f;
-                gz = gz_mdps / 1000.0f;
+            
+            // Read gyroscope
+            int16_t raw_gyro[3] = {0};
+            if (lsm6dsv16x_angular_rate_raw_get(&dev_ctx, raw_gyro) == 0) {
+                float gx_mdps = lsm6dsv16x_from_fs1000_to_mdps(raw_gyro[0]);
+                float gy_mdps = lsm6dsv16x_from_fs1000_to_mdps(raw_gyro[1]);
+                float gz_mdps = lsm6dsv16x_from_fs1000_to_mdps(raw_gyro[2]);
+                sample->gx = gx_mdps / 1000.0f;
+                sample->gy = gy_mdps / 1000.0f;
+                sample->gz = gz_mdps / 1000.0f;
             }
-
-            // Attempt to read SFLP rotation vector (FIFO out) -- may not always be present
+            
+            // Try to read SFLP quaternion from FIFO
             lsm6dsv16x_fifo_out_raw_t fifo_raw;
-            if (lsm6dsv16x_fifo_out_raw_get(&dev_ctx, &fifo_raw) == 0 &&
-                fifo_raw.tag == LSM6DSV16X_SFLP_GAME_ROTATION_VECTOR_TAG) {
-                decode_sflp_rotation_vector(fifo_raw.data, &q0, &q1, &q2, &q3);
-            } else {
-                // fallback: AH qvar (if present)
-                int16_t qraw;
-                if (lsm6dsv16x_ah_qvar_raw_get(&dev_ctx, &qraw) == 0) {
-                    float qx = qraw / 16384.0f;
-                    q1 = qx; q2 = 0.0f; q3 = 0.0f;
-                    float w_sq = 1.0f - (q1*q1 + q2*q2 + q3*q3);
-                    q0 = (w_sq > 0.0f) ? sqrtf(w_sq) : 0.0f;
+            bool quaternion_valid = false;
+            
+            if (lsm6dsv16x_fifo_out_raw_get(&dev_ctx, &fifo_raw) == 0) {
+                if (fifo_raw.tag == LSM6DSV16X_SFLP_GAME_ROTATION_VECTOR_TAG) {
+                    decode_sflp_quaternion(fifo_raw.data, 
+                                          &sample->q0, &sample->q1, 
+                                          &sample->q2, &sample->q3);
+                    quaternion_valid = true;
                 }
             }
-
-            // Convert quaternion -> Euler (deg)
-            float roll = atan2f(2*(q0*q1 + q2*q3), 1 - 2*(q1*q1 + q2*q2));
-            float pitch = asinf(fmaxf(-1.0f, fminf(1.0f, 2*(q0*q2 - q3*q1))));
-            float yaw = atan2f(2*(q0*q3 + q1*q2), 1 - 2*(q2*q2 + q3*q3));
-            const float RAD_TO_DEG = 57.29577951308232f;
-
-            ESP_LOGI(TAG, "#%llu ts=%lld us, accel=[%.3f,%.3f,%.3f] m/s^2, gyro=[%.3f,%.3f,%.3f] dps, euler=[%.2f,%.2f,%.2f]",
-                     sample_cnt, ts,
-                     ax, ay, az, gx, gy, gz,
-                     roll*RAD_TO_DEG, pitch*RAD_TO_DEG, yaw*RAD_TO_DEG);
+            
+            // If no SFLP quaternion, use accelerometer-based simple angles
+            if (!quaternion_valid) {
+                // Create simple quaternion from accelerometer tilt
+                float roll_rad = atan2f(sample->ay, sample->az);
+                float pitch_rad = atan2f(-sample->ax, 
+                                        sqrtf(sample->ay * sample->ay + sample->az * sample->az));
+                
+                // Convert to quaternion (rotation around Y then X, no yaw)
+                float cr = cosf(roll_rad * 0.5f);
+                float sr = sinf(roll_rad * 0.5f);
+                float cp = cosf(pitch_rad * 0.5f);
+                float sp = sinf(pitch_rad * 0.5f);
+                
+                sample->q0 = cr * cp;
+                sample->q1 = sr * cp;
+                sample->q2 = cr * sp;
+                sample->q3 = -sr * sp;
+            }
+            
+            // Convert quaternion to Euler angles
+            quaternion_to_euler(sample->q0, sample->q1, sample->q2, sample->q3,
+                              &sample->roll, &sample->pitch, &sample->yaw);
+            
+            // Update counters
+            total_samples++;
+            sample_index = (sample_index + 1) % SAMPLE_BUFFER_SIZE;
+            print_counter++;
+            
+            // Print at 1Hz (every 120 samples)
+            if (print_counter >= 120) {
+                print_counter = 0;
+                
+                // Print the most recent sample
+                ESP_LOGI(TAG, "═══════════════════════════════════════════════════════");
+                ESP_LOGI(TAG, "Sample #%llu @ %lld us", total_samples, sample->timestamp_us);
+                ESP_LOGI(TAG, "Accel:  X=%7.3f, Y=%7.3f, Z=%7.3f m/s²", 
+                         sample->ax, sample->ay, sample->az);
+                ESP_LOGI(TAG, "Gyro:   X=%7.3f, Y=%7.3f, Z=%7.3f dps", 
+                         sample->gx, sample->gy, sample->gz);
+                ESP_LOGI(TAG, "Quat:   w=%6.3f, x=%6.3f, y=%6.3f, z=%6.3f", 
+                         sample->q0, sample->q1, sample->q2, sample->q3);
+                ESP_LOGI(TAG, "Euler:  Roll=%7.2f°, Pitch=%7.2f°, Yaw=%7.2f°", 
+                         sample->roll, sample->pitch, sample->yaw);
+                ESP_LOGI(TAG, "═══════════════════════════════════════════════════════\n");
+            }
+            
+            // Clear interrupt by reading all_sources register
+            lsm6dsv16x_all_sources_t all_sources;
+            lsm6dsv16x_all_sources_get(&dev_ctx, &all_sources);
         }
-        lsm6dsv16x_all_sources_t all_sources;
-        lsm6dsv16x_all_sources_get(&dev_ctx, &all_sources); 
-        // Reading this register clears the hardware INT pin so it can pulse again.
     }
 }
 
 static void i2c_scan(i2c_port_t i2c_num)
 {
-    ESP_LOGI(TAG, "Starting I2C scan");
+    ESP_LOGI(TAG, "Starting I2C scan...");
+    int found = 0;
     for (int addr = 0x08; addr < 0x78; addr++) {
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
@@ -157,18 +235,27 @@ static void i2c_scan(i2c_port_t i2c_num)
         esp_err_t err = i2c_master_cmd_begin(i2c_num, cmd, pdMS_TO_TICKS(50));
         i2c_cmd_link_delete(cmd);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "I2C device found at 0x%02x", addr);
+            ESP_LOGI(TAG, "  ✓ I2C device found at address 0x%02x", addr);
+            found++;
         }
     }
+    ESP_LOGI(TAG, "I2C scan complete. Found %d device(s).\n", found);
 }
 
 void app_main(void) {
-    // I2C configuration - adjust pins to your board wiring if needed
+    ESP_LOGI(TAG, "╔═══════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║   LSM6DSV16X IMU - 120Hz Collection, 1Hz Display     ║");
+    ESP_LOGI(TAG, "║   with SFLP Quaternion Sensor Fusion                 ║");
+    ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════════╝\n");
+
+    // I2C configuration
     const i2c_port_t I2C_NUM = I2C_NUM_0;
     const gpio_num_t SDA_PIN = GPIO_NUM_8;
     const gpio_num_t SCL_PIN = GPIO_NUM_9;
-    const gpio_num_t INT_GPIO  = GPIO_NUM_4;
+    const gpio_num_t INT_PIN = GPIO_NUM_4;  // INT1 pin
 
+    ESP_LOGI(TAG, "Initializing I2C bus (SDA=GPIO%d, SCL=GPIO%d)...", SDA_PIN, SCL_PIN);
+    
     i2c_config_t i2c_conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = SDA_PIN,
@@ -177,79 +264,144 @@ void app_main(void) {
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master = {.clk_speed = 400000},
     };
-    i2c_param_config(I2C_NUM, &i2c_conf);
-    i2c_driver_install(I2C_NUM, I2C_MODE_MASTER, 0, 0, 0);
+    
+    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM, &i2c_conf));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM, I2C_MODE_MASTER, 0, 0, 0));
+    ESP_LOGI(TAG, "I2C initialized successfully.\n");
 
-    // quick scan - confirm address presence (0x6A or 0x6B)
+    // Scan I2C bus
     i2c_scan(I2C_NUM);
 
-    // prepare device context for ST driver
+    // Setup device context for ST driver
     lsm_handle.i2c_num = I2C_NUM;
-    lsm_handle.i2c_addr = (uint8_t)(LSM6DSV16X_I2C_ADD_H >> 1); // typically 0x6B
+    lsm_handle.i2c_addr = (uint8_t)(LSM6DSV16X_I2C_ADD_H >> 1); // 0x6B
 
     dev_ctx.write_reg = platform_write;
     dev_ctx.read_reg = platform_read;
     dev_ctx.mdelay = platform_delay;
     dev_ctx.handle = &lsm_handle;
 
+    // Verify device identity
+    ESP_LOGI(TAG, "Checking device identity...");
     uint8_t whoamI = 0;
-    if (lsm6dsv16x_device_id_get(&dev_ctx, &whoamI) != 0 || whoamI != LSM6DSV16X_ID) {
-        ESP_LOGE(TAG, "LSM6DSV16X not found (whoami=0x%02x)", whoamI);
-        // keep running so diagnostics (i2c scan) can be read
+    if (lsm6dsv16x_device_id_get(&dev_ctx, &whoamI) != 0) {
+        ESP_LOGE(TAG, "Failed to read WHO_AM_I register!");
+        ESP_LOGE(TAG, "Check your I2C connections and pull-up resistors.");
+        return;
+    }
+    
+    if (whoamI != LSM6DSV16X_ID) {
+        ESP_LOGE(TAG, "Wrong device ID! Expected 0x%02x, got 0x%02x", LSM6DSV16X_ID, whoamI);
+        ESP_LOGE(TAG, "This may not be an LSM6DSV16X sensor.");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "✓ LSM6DSV16X detected (WHO_AM_I = 0x%02x)\n", whoamI);
+
+    // Perform software reset
+    ESP_LOGI(TAG, "Performing software reset...");
+    if (lsm6dsv16x_sw_reset(&dev_ctx) != 0) {
+        ESP_LOGE(TAG, "Failed to reset device");
+        return;
+    }
+    platform_delay(20);
+    
+    // Wait for reset to complete
+    ESP_LOGI(TAG, "Waiting for reset to complete...");
+    lsm6dsv16x_ctrl3_t ctrl3;
+    int timeout = 100;
+    do {
+        if (lsm6dsv16x_read_reg(&dev_ctx, LSM6DSV16X_CTRL3, (uint8_t*)&ctrl3, 1) != 0) {
+            ESP_LOGE(TAG, "Failed to read CTRL3 register");
+            break;
+        }
+        platform_delay(1);
+        timeout--;
+    } while (ctrl3.sw_reset && timeout > 0);
+    
+    if (timeout == 0) {
+        ESP_LOGW(TAG, "Reset timeout - continuing anyway");
     } else {
-        ESP_LOGI(TAG, "Found LSM6DSV16X (0x%02x)", whoamI);
+        ESP_LOGI(TAG, "✓ Reset complete\n");
     }
 
-    // Basic configuration: enable block data update and set scales/ODR.
+    // Configure sensor
+    ESP_LOGI(TAG, "Configuring sensor...");
     int32_t rc;
+    
+    // Enable block data update
     rc = lsm6dsv16x_block_data_update_set(&dev_ctx, PROPERTY_ENABLE);
-    ESP_LOGI(TAG, "bdu set rc=%d", rc);
+    ESP_LOGI(TAG, "✓ Block data update: rc=%d", (int)rc);
+    
+    // Set accelerometer full scale to ±4g
     rc = lsm6dsv16x_xl_full_scale_set(&dev_ctx, LSM6DSV16X_4g);
-    ESP_LOGI(TAG, "xl fs set rc=%d", rc);
+    ESP_LOGI(TAG, "✓ Accel full scale ±4g: rc=%d", (int)rc);
+    
+    // Set gyroscope full scale to ±1000 dps
     rc = lsm6dsv16x_gy_full_scale_set(&dev_ctx, LSM6DSV16X_1000dps);
-    ESP_LOGI(TAG, "gy fs set rc=%d", rc);
-
-    // HA01 approximates 120-125Hz HAODR mode
-    rc = lsm6dsv16x_xl_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_HA01_AT_125Hz);
-    ESP_LOGI(TAG, "xl odr set rc=%d", rc);
-    rc = lsm6dsv16x_gy_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_HA01_AT_125Hz);
-    ESP_LOGI(TAG, "gy odr set rc=%d", rc);
-
-    // SFLP game rotation 120Hz
+    ESP_LOGI(TAG, "✓ Gyro full scale ±1000dps: rc=%d", (int)rc);
+    
+    // Set accelerometer ODR to 120 Hz
+    rc = lsm6dsv16x_xl_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_AT_120Hz);
+    ESP_LOGI(TAG, "✓ Accel ODR 120Hz: rc=%d", (int)rc);
+    
+    // Set gyroscope ODR to 120 Hz
+    rc = lsm6dsv16x_gy_data_rate_set(&dev_ctx, LSM6DSV16X_ODR_AT_120Hz);
+    ESP_LOGI(TAG, "✓ Gyro ODR 120Hz: rc=%d", (int)rc);
+    
+    // Enable SFLP game rotation (quaternion without magnetometer)
     rc = lsm6dsv16x_sflp_game_rotation_set(&dev_ctx, 1);
-    ESP_LOGI(TAG, "sflp game rotation enable rc=%d", rc);
+    ESP_LOGI(TAG, "✓ SFLP game rotation enabled: rc=%d", (int)rc);
+    
+    // Set SFLP data rate to 120 Hz
     rc = lsm6dsv16x_sflp_data_rate_set(&dev_ctx, LSM6DSV16X_SFLP_120Hz);
-    ESP_LOGI(TAG, "sflp odr set rc=%d", rc);
-
-    rc = lsm6dsv16x_fifo_sflp_batch_set(&dev_ctx, (lsm6dsv16x_fifo_sflp_raw_t){.game_rotation = 1, .gravity = 0, .gbias = 0});
-    ESP_LOGI(TAG, "fifo sflp batch set rc=%d", rc);
-
-    // Route gyro and accel data-ready to INT1
+    ESP_LOGI(TAG, "✓ SFLP ODR 120Hz: rc=%d", (int)rc);
+    
+    // Configure FIFO to output SFLP data
+    lsm6dsv16x_fifo_sflp_raw_t sflp_batch = {
+        .game_rotation = 1,  // Enable game rotation vector in FIFO
+        .gravity = 0,
+        .gbias = 0
+    };
+    rc = lsm6dsv16x_fifo_sflp_batch_set(&dev_ctx, sflp_batch);
+    ESP_LOGI(TAG, "✓ FIFO SFLP batch configured: rc=%d", (int)rc);
+    
+    // Set FIFO to continuous mode
+    rc = lsm6dsv16x_fifo_mode_set(&dev_ctx, LSM6DSV16X_STREAM_MODE);
+    ESP_LOGI(TAG, "✓ FIFO stream mode: rc=%d", (int)rc);
+    
+    // Route gyro data-ready to INT1 pin
     lsm6dsv16x_pin_int_route_t int_route;
     memset(&int_route, 0, sizeof(int_route));
-    int_route.drdy_g = 1;
-    int_route.drdy_xl = 1; // route accel DRDY as well (debug)
+    int_route.drdy_g = 1;  // Gyro data ready on INT1
     rc = lsm6dsv16x_pin_int1_route_set(&dev_ctx, &int_route);
-    ESP_LOGI(TAG, "int1 route rc=%d", rc);
-
-    rc = lsm6dsv16x_embedded_int_cfg_set(&dev_ctx, LSM6DSV16X_INT_LATCH_ENABLE);
-    ESP_LOGI(TAG, "int latch rc=%d", rc);
-
-    // Setup ESP GPIO for INT pin and queue to capture timestamps in ISR
+    ESP_LOGI(TAG, "✓ INT1 route configured: rc=%d", (int)rc);
+    
+    ESP_LOGI(TAG, "Configuration complete!\n");
+    
+    // Setup GPIO interrupt for INT1 pin
+    ESP_LOGI(TAG, "Configuring INT1 interrupt (GPIO%d)...", INT_PIN);
     drdy_queue = xQueueCreate(10, sizeof(int64_t));
+    
     gpio_config_t io_conf = {
-        .intr_type = GPIO_INTR_NEGEDGE,    // Look for the "Pull-Down" signal
-        .pin_bit_mask = (1ULL << INT_GPIO),
+        .intr_type = GPIO_INTR_POSEDGE,  // Trigger on rising edge
+        .pin_bit_mask = (1ULL << INT_PIN),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE, // Pull the line to 3.3V by default
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
     };
     gpio_config(&io_conf);
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(INT_GPIO, gpio_isr_handler, NULL);
+    gpio_isr_handler_add(INT_PIN, gpio_isr_handler, NULL);
+    ESP_LOGI(TAG, "✓ Interrupt configured\n");
+    
+    // Give sensor time to stabilize
+    ESP_LOGI(TAG, "Waiting for sensor to stabilize...");
+    platform_delay(200);
+    ESP_LOGI(TAG, "✓ Sensor ready\n");
 
-    ESP_LOGI(TAG, "Setup complete, starting imu_task");
-    xTaskCreate(imu_task, "imu_task", 4096, NULL, 5, NULL);
-    // main can continue or sleep
-    for (;;) vTaskDelay(pdMS_TO_TICKS(10000));
+    ESP_LOGI(TAG, "Starting 120Hz interrupt-driven data acquisition...");
+    ESP_LOGI(TAG, "Printing every 1 second (120 samples)\n");
+    
+    xTaskCreate(imu_task, "imu_task", 8192, NULL, 5, NULL);
 }
