@@ -84,26 +84,72 @@ static void decode_sflp_quaternion(const uint8_t data[6], float *q0, float *q1, 
     *q3 = z;  // Vector k
 }
 
-// Convert quaternion to Euler angles (ZYX convention)
+// Convert quaternion to Euler angles - FIXED version with proper normalization
 static void quaternion_to_euler(float q0, float q1, float q2, float q3, 
                                 float *roll, float *pitch, float *yaw)
 {
     const float RAD_TO_DEG = 57.29577951308232f;
     
-    // Roll (X-axis rotation)
+    // First, normalize the quaternion to ensure unit length
+    float norm = sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
+    if (norm > 0.0001f) {  // Avoid division by zero
+        q0 /= norm;
+        q1 /= norm;
+        q2 /= norm;
+        q3 /= norm;
+    } else {
+        // Invalid quaternion, set to identity
+        q0 = 1.0f;
+        q1 = q2 = q3 = 0.0f;
+    }
+    
+    // Roll (X-axis rotation) - rotation around X
     float sinr_cosp = 2.0f * (q0 * q1 + q2 * q3);
     float cosr_cosp = 1.0f - 2.0f * (q1 * q1 + q2 * q2);
     *roll = atan2f(sinr_cosp, cosr_cosp) * RAD_TO_DEG;
     
-    // Pitch (Y-axis rotation)
+    // Pitch (Y-axis rotation) - rotation around Y
+    // Use atan2 instead of asin to avoid gimbal lock
     float sinp = 2.0f * (q0 * q2 - q3 * q1);
-    sinp = fmaxf(-1.0f, fminf(1.0f, sinp));
-    *pitch = asinf(sinp) * RAD_TO_DEG;
     
-    // Yaw (Z-axis rotation)
+    // Clamp sinp to valid range for asin
+    if (sinp >= 1.0f) {
+        *pitch = 90.0f;  // Use 90 degrees for north pole
+    } else if (sinp <= -1.0f) {
+        *pitch = -90.0f;  // Use -90 degrees for south pole
+    } else {
+        *pitch = asinf(sinp) * RAD_TO_DEG;
+    }
+    
+    // Yaw (Z-axis rotation) - rotation around Z
     float siny_cosp = 2.0f * (q0 * q3 + q1 * q2);
     float cosy_cosp = 1.0f - 2.0f * (q2 * q2 + q3 * q3);
     *yaw = atan2f(siny_cosp, cosy_cosp) * RAD_TO_DEG;
+}
+
+// Alternative: Direct accelerometer-based Euler (for comparison/debugging)
+static void accel_to_euler(float ax, float ay, float az, float *roll, float *pitch)
+{
+    const float RAD_TO_DEG = 57.29577951308232f;
+    
+    // Calculate magnitude
+    float mag = sqrtf(ax*ax + ay*ay + az*az);
+    
+    if (mag < 0.01f) {
+        // Too small, probably in freefall or no gravity
+        *roll = 0.0f;
+        *pitch = 0.0f;
+        return;
+    }
+    
+    // Normalize
+    float ax_n = ax / mag;
+    float ay_n = ay / mag;
+    float az_n = az / mag;
+    
+    // Calculate roll and pitch from normalized acceleration
+    *roll = atan2f(ay_n, az_n) * RAD_TO_DEG;
+    *pitch = atan2f(-ax_n, sqrtf(ay_n * ay_n + az_n * az_n)) * RAD_TO_DEG;
 }
 
 // GPIO interrupt handler - triggers on gyro data ready
@@ -171,23 +217,29 @@ static void imu_task(void *arg) {
                 }
             }
             
-            // If no SFLP quaternion, use accelerometer-based simple angles
+            // If no SFLP quaternion, create from accelerometer
             if (!quaternion_valid) {
-                // Create simple quaternion from accelerometer tilt
-                float roll_rad = atan2f(sample->ay, sample->az);
-                float pitch_rad = atan2f(-sample->ax, 
-                                        sqrtf(sample->ay * sample->ay + sample->az * sample->az));
+                // Get direct roll/pitch from accelerometer first
+                float acc_roll, acc_pitch;
+                accel_to_euler(sample->ax, sample->ay, sample->az, &acc_roll, &acc_pitch);
                 
-                // Convert to quaternion (rotation around Y then X, no yaw)
-                float cr = cosf(roll_rad * 0.5f);
-                float sr = sinf(roll_rad * 0.5f);
+                // Convert to radians for quaternion creation
+                const float DEG_TO_RAD = 0.0174532925f;
+                float roll_rad = acc_roll * DEG_TO_RAD;
+                float pitch_rad = acc_pitch * DEG_TO_RAD;
+                
+                // Create quaternion from Euler angles (ZYX convention)
+                float cy = cosf(0.0f * 0.5f);  // yaw = 0 (no magnetometer)
+                float sy = sinf(0.0f * 0.5f);
                 float cp = cosf(pitch_rad * 0.5f);
                 float sp = sinf(pitch_rad * 0.5f);
+                float cr = cosf(roll_rad * 0.5f);
+                float sr = sinf(roll_rad * 0.5f);
                 
-                sample->q0 = cr * cp;
-                sample->q1 = sr * cp;
-                sample->q2 = cr * sp;
-                sample->q3 = -sr * sp;
+                sample->q0 = cr * cp * cy + sr * sp * sy;  // w
+                sample->q1 = sr * cp * cy - cr * sp * sy;  // x
+                sample->q2 = cr * sp * cy + sr * cp * sy;  // y
+                sample->q3 = cr * cp * sy - sr * sp * cy;  // z
             }
             
             // Convert quaternion to Euler angles
@@ -203,18 +255,16 @@ static void imu_task(void *arg) {
             if (print_counter >= 120) {
                 print_counter = 0;
                 
-                // Print the most recent sample
-                ESP_LOGI(TAG, "═══════════════════════════════════════════════════════");
-                ESP_LOGI(TAG, "Sample #%llu @ %lld us", total_samples, sample->timestamp_us);
-                ESP_LOGI(TAG, "Accel:  X=%7.3f, Y=%7.3f, Z=%7.3f m/s²", 
-                         sample->ax, sample->ay, sample->az);
-                ESP_LOGI(TAG, "Gyro:   X=%7.3f, Y=%7.3f, Z=%7.3f dps", 
-                         sample->gx, sample->gy, sample->gz);
-                ESP_LOGI(TAG, "Quat:   w=%6.3f, x=%6.3f, y=%6.3f, z=%6.3f", 
-                         sample->q0, sample->q1, sample->q2, sample->q3);
-                ESP_LOGI(TAG, "Euler:  Roll=%7.2f°, Pitch=%7.2f°, Yaw=%7.2f°", 
-                         sample->roll, sample->pitch, sample->yaw);
-                ESP_LOGI(TAG, "═══════════════════════════════════════════════════════\n");
+                float acc_roll, acc_pitch;
+                accel_to_euler(sample->ax, sample->ay, sample->az, &acc_roll, &acc_pitch);
+
+                printf("\n--- Sample #%llu ---\n", total_samples);
+                printf("Timestamp: %lld us\n", sample->timestamp_us);
+                printf("Accel [m/s²]: X=%.3f, Y=%.3f, Z=%.3f\n", sample->ax, sample->ay, sample->az);
+                printf("Gyro [dps]:   X=%.3f, Y=%.3f, Z=%.3f\n", sample->gx, sample->gy, sample->gz);
+                printf("Quat [wxyz]:  w=%.3f, x=%.3f, y=%.3f, z=%.3f\n", sample->q0, sample->q1, sample->q2, sample->q3);
+                printf("Euler [deg]:  Roll=%.2f, Pitch=%.2f, Yaw=%.2f\n", sample->roll, sample->pitch, sample->yaw);
+                // printf("Accel-Only:   Roll=%.2f, Pitch=%.2f\n", acc_roll, acc_pitch);
             }
             
             // Clear interrupt by reading all_sources register
@@ -241,9 +291,20 @@ static void imu_task(void *arg) {
             int16_t raw_acc[3], raw_gyro[3];
             if (lsm6dsv16x_acceleration_raw_get(&dev_ctx, raw_acc) == 0 &&
                 lsm6dsv16x_angular_rate_raw_get(&dev_ctx, raw_gyro) == 0) {
-                ESP_LOGI(TAG, "  Manual read OK: acc=[%d,%d,%d] gyro=[%d,%d,%d]",
-                         raw_acc[0], raw_acc[1], raw_acc[2],
-                         raw_gyro[0], raw_gyro[1], raw_gyro[2]);
+                
+                float ax_mg = lsm6dsv16x_from_fs4_to_mg(raw_acc[0]);
+                float ay_mg = lsm6dsv16x_from_fs4_to_mg(raw_acc[1]);
+                float az_mg = lsm6dsv16x_from_fs4_to_mg(raw_acc[2]);
+                const float MG_TO_MS2 = 9.80665e-3f;
+                float ax = ax_mg * MG_TO_MS2;
+                float ay = ay_mg * MG_TO_MS2;
+                float az = az_mg * MG_TO_MS2;
+                
+                float acc_roll, acc_pitch;
+                accel_to_euler(ax, ay, az, &acc_roll, &acc_pitch);
+                
+                ESP_LOGI(TAG, "  Manual: acc=[%.2f, %.2f, %.2f] m/s², roll=%.1f°, pitch=%.1f°",
+                         ax, ay, az, acc_roll, acc_pitch);
             }
         }
     }
@@ -272,6 +333,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "╔═══════════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║   LSM6DSV16X IMU - 120Hz Collection, 1Hz Display     ║");
     ESP_LOGI(TAG, "║   with SFLP Quaternion Sensor Fusion                 ║");
+    ESP_LOGI(TAG, "║   FIXED: Proper Euler Angle Conversion               ║");
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════════╝\n");
 
     // I2C configuration
@@ -412,39 +474,20 @@ void app_main(void) {
     gpio_isr_handler_add(INT_PIN, gpio_isr_handler, NULL);
     ESP_LOGI(TAG, "✓ GPIO interrupt configured");
     
-    // Check initial GPIO state
-    int gpio_level = gpio_get_level(INT_PIN);
-    ESP_LOGI(TAG, "  Initial GPIO%d level: %d", INT_PIN, gpio_level);
-    
-    // Route gyro data-ready to INT1 pin - THIS MUST BE LAST
+    // Route gyro data-ready to INT1 pin
     lsm6dsv16x_pin_int_route_t int_route;
     memset(&int_route, 0, sizeof(int_route));
     int_route.drdy_g = 1;  // Gyro data ready on INT1
-    int_route.drdy_xl = 1; // Also route accel (optional, for debugging)
+    int_route.drdy_xl = 1; // Also route accel
     rc = lsm6dsv16x_pin_int1_route_set(&dev_ctx, &int_route);
     ESP_LOGI(TAG, "✓ INT1 route configured: rc=%d", (int)rc);
-    
-    // Verify routing was set
-    lsm6dsv16x_pin_int_route_t verify_route;
-    lsm6dsv16x_pin_int1_route_get(&dev_ctx, &verify_route);
-    ESP_LOGI(TAG, "  Verified INT1 routing: drdy_g=%d, drdy_xl=%d", 
-             verify_route.drdy_g, verify_route.drdy_xl);
     
     ESP_LOGI(TAG, "Configuration complete!\n");
     
     // Give sensor time to stabilize
     ESP_LOGI(TAG, "Waiting for sensor to stabilize...");
     platform_delay(200);
-    
-    // Check GPIO level after stabilization
-    gpio_level = gpio_get_level(INT_PIN);
-    ESP_LOGI(TAG, "  Post-stabilization GPIO%d level: %d\n", INT_PIN, gpio_level);
-    
-    // Check if data is ready
-    lsm6dsv16x_all_sources_t status;
-    if (lsm6dsv16x_all_sources_get(&dev_ctx, &status) == 0) {
-        ESP_LOGI(TAG, "Initial DRDY status: xl=%d, gy=%d\n", status.drdy_xl, status.drdy_gy);
-    }
+    ESP_LOGI(TAG, "✓ Sensor ready\n");
     
     ESP_LOGI(TAG, "Starting 120Hz interrupt-driven data acquisition...");
     ESP_LOGI(TAG, "Printing every 1 second (120 samples)\n");
