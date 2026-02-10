@@ -16,5 +16,6 @@
     "--compile-commands-dir=c:\\Users\\Kieran\\Lab2\\build"
   ],
   "idf.portWin": "COM4",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.currentSetup": "C:\\Users\\Kieran\\esp\\v5.5.2\\esp-idf"
 }
