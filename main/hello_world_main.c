@@ -1,3 +1,9 @@
+// need to know where the application layer and other layers reside.
+// gatt- generic attribute profile, defines the structure of the data and services provided by the device
+// uses concepts called services and characteristics to communicate data. Services are collections of characteristics, and characteristics are individual data points or attributes that can be read, written, or subscribed to for notifications.
+// look at slides, need to condigure CCCD?
+
+
 #include "sdkconfig.h"
 #include <stdio.h>
 #include <inttypes.h>
