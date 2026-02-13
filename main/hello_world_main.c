@@ -14,9 +14,24 @@
 #include "driver/i2c.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_err.h"
+#include "nvs_flash.h"
+#include "esp_mac.h"
+#include "esp_bt.h"
 #include "lsm6dsv16x_reg.h"
+#include "esp_nimble_hci.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "host/ble_hs_adv.h"
+#include "host/ble_uuid.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "os/os_mbuf.h"
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 
 static const char *TAG = "imu";
 
@@ -42,7 +57,242 @@ static imu_sample_t sample_buffer[SAMPLE_BUFFER_SIZE];
 static volatile uint32_t sample_index = 0;
 static volatile uint64_t total_samples = 0;
 
+typedef struct {
+    uint32_t sample_counter;
+    uint64_t timestamp_us;
+} ble_telemetry_t;
+
+static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t ble_tx_chr_val_handle;
+static uint8_t ble_addr_type;
+static bool ble_notify_enabled = false;
+static volatile uint32_t ble_notify_counter = 0;
+static char ble_device_name[20] = "Lab3-IMU";
+
 static QueueHandle_t drdy_queue;
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg);
+static void ble_advertise_start(void);
+
+static int ble_chr_access_cb(uint16_t conn_handle,
+                             uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt,
+                             void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    (void)arg;
+
+    ble_telemetry_t packet = {
+        .sample_counter = ble_notify_counter,
+        .timestamp_us = (uint64_t)esp_timer_get_time(),
+    };
+
+    int rc = os_mbuf_append(ctxt->om, &packet, sizeof(packet));
+    return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(0xFFF0),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(0xFFF1),
+                .access_cb = ble_chr_access_cb,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &ble_tx_chr_val_handle,
+            },
+            {0},
+        },
+    },
+    {0},
+};
+
+static void ble_notify_task(void *arg)
+{
+    (void)arg;
+
+    for (;;) {
+        if (ble_conn_handle != BLE_HS_CONN_HANDLE_NONE && ble_notify_enabled) {
+            ble_telemetry_t packet = {
+                .sample_counter = ++ble_notify_counter,
+                .timestamp_us = (uint64_t)esp_timer_get_time(),
+            };
+
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(&packet, sizeof(packet));
+            if (om != NULL) {
+                int rc = ble_gatts_notify_custom(ble_conn_handle, ble_tx_chr_val_handle, om);
+                if (rc != 0) {
+                    ESP_LOGW(TAG, "Notify failed, rc=%d", rc);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void ble_on_sync(void)
+{
+    uint8_t addr_val[6] = {0};
+    int rc = ble_hs_id_infer_auto(0, &ble_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed: %d", rc);
+        return;
+    }
+
+    rc = ble_hs_id_copy_addr(ble_addr_type, addr_val, NULL);
+    if (rc != 0) {
+        ESP_LOGW(TAG, "ble_hs_id_copy_addr failed: %d", rc);
+    } else {
+        ESP_LOGI(TAG,
+                 "BLE addr type=%u addr=%02X:%02X:%02X:%02X:%02X:%02X name=%s",
+                 ble_addr_type,
+                 addr_val[5], addr_val[4], addr_val[3],
+                 addr_val[2], addr_val[1], addr_val[0],
+                 ble_device_name);
+    }
+
+    ble_advertise_start();
+}
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                ble_conn_handle = event->connect.conn_handle;
+                ESP_LOGI(TAG, "BLE connected, conn_handle=%d", ble_conn_handle);
+            } else {
+                ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+                ESP_LOGW(TAG, "BLE connect failed; status=%d", event->connect.status);
+                ble_advertise_start();
+            }
+            return 0;
+
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
+            ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            ble_notify_enabled = false;
+            ble_advertise_start();
+            return 0;
+
+        case BLE_GAP_EVENT_SUBSCRIBE:
+            if (event->subscribe.attr_handle == ble_tx_chr_val_handle) {
+                ble_notify_enabled = event->subscribe.cur_notify;
+                ESP_LOGI(TAG, "BLE notify %s", ble_notify_enabled ? "enabled" : "disabled");
+            }
+            return 0;
+
+        case BLE_GAP_EVENT_ADV_COMPLETE:
+            ble_advertise_start();
+            return 0;
+
+        default:
+            return 0;
+    }
+}
+
+static void ble_advertise_start(void)
+{
+    struct ble_hs_adv_fields fields;
+    memset(&fields, 0, sizeof(fields));
+
+    const char *name = ble_svc_gap_device_name();
+    fields.name = (const uint8_t *)name;
+    fields.name_len = strlen(name);
+    fields.name_is_complete = 1;
+
+    uint16_t svc_uuid = 0xFFF0;
+    fields.uuids16 = (ble_uuid16_t[]){{ .u = { BLE_UUID_TYPE_16 }, .value = svc_uuid }};
+    fields.num_uuids16 = 1;
+    fields.uuids16_is_complete = 1;
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_set_fields failed: %d", rc);
+        return;
+    }
+
+    struct ble_gap_adv_params adv_params;
+    memset(&adv_params, 0, sizeof(adv_params));
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+
+    rc = ble_gap_adv_start(ble_addr_type, NULL, BLE_HS_FOREVER,
+                           &adv_params, ble_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_start failed: %d", rc);
+    } else {
+        ESP_LOGI(TAG, "BLE advertising started");
+    }
+}
+
+static void ble_host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static void ble_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    uint8_t bt_mac[6] = {0};
+    ESP_ERROR_CHECK(esp_read_mac(bt_mac, ESP_MAC_BT));
+    snprintf(ble_device_name, sizeof(ble_device_name),
+             "Lab3-%02X%02X", bt_mac[4], bt_mac[5]);
+
+    err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_bt_controller_mem_release failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    err = esp_bt_controller_init(&bt_cfg);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = esp_nimble_hci_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_nimble_hci_init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    nimble_port_init();
+
+    ble_hs_cfg.sync_cb = ble_on_sync;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ESP_ERROR_CHECK(ble_svc_gap_device_name_set(ble_device_name));
+
+    int rc = ble_gatts_count_cfg(gatt_svcs);
+    ESP_ERROR_CHECK((rc == 0) ? ESP_OK : ESP_FAIL);
+    rc = ble_gatts_add_svcs(gatt_svcs);
+    ESP_ERROR_CHECK((rc == 0) ? ESP_OK : ESP_FAIL);
+
+    nimble_port_freertos_init(ble_host_task);
+    xTaskCreate(ble_notify_task, "ble_notify_task", 4096, NULL, 5, NULL);
+}
 
 static int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp, uint16_t len)
 {
@@ -341,6 +591,8 @@ void app_main(void) {
     ESP_LOGI(TAG, "║   with SFLP Quaternion Sensor Fusion                 ║");
     ESP_LOGI(TAG, "║   FIXED: Proper Euler Angle Conversion               ║");
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════════╝\n");
+
+    ble_init();
 
     // I2C configuration
     const i2c_port_t I2C_NUM = I2C_NUM_0;
