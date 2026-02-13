@@ -17,9 +17,7 @@
 #include "esp_err.h"
 #include "nvs_flash.h"
 #include "esp_mac.h"
-#include "esp_bt.h"
 #include "lsm6dsv16x_reg.h"
-#include "esp_nimble_hci.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -50,6 +48,8 @@ typedef struct {
     float gx, gy, gz;         // Angular velocity in dps
     float q0, q1, q2, q3;     // Quaternion (w, x, y, z)
     float roll, pitch, yaw;   // Euler angles in degrees
+    int16_t raw_acc[3];       // Raw accelerometer registers (X/Y/Z)
+    int16_t raw_gyro[3];      // Raw gyroscope registers (X/Y/Z)
 } imu_sample_t;
 
 #define SAMPLE_BUFFER_SIZE 120  // Store 1 second of data at 120Hz
@@ -57,10 +57,50 @@ static imu_sample_t sample_buffer[SAMPLE_BUFFER_SIZE];
 static volatile uint32_t sample_index = 0;
 static volatile uint64_t total_samples = 0;
 
-typedef struct {
-    uint32_t sample_counter;
-    uint64_t timestamp_us;
-} ble_telemetry_t;
+/* ── BLE Packet Format (Lab3 spec) ──────────────────────────────
+ *  Offset  Size  Field            Scaling / Notes
+ *  ───────────────────────────────────────────────────────────────
+ *   0       3    Header           Constant 0xAA 0xAA 0xAA
+ *   3       4    Sample counter   uint32, little-endian
+ *   7       8    Timestamp        uint64, ESP32 µs, little-endian
+ *  15       6    Accel X/Y/Z      3×int16 LE, raw LSB
+ *                                  → mg   = raw × 0.122
+ *                                  → m/s² = raw × 0.122 × 9.80665e-3
+ *                                  (±4 g full-scale)
+ *  21       6    Gyro  X/Y/Z      3×int16 LE, raw LSB
+ *                                  → mdps = raw × 35.0
+ *                                  → dps  = raw × 0.035
+ *                                  (±1000 dps full-scale)
+ *  27       6    Quat qx/qy/qz   3×uint16 LE, IEEE 754 half-float
+ *                                  qw = sqrt(1 - qx² - qy² - qz²)
+ *  ───────────────────────────────────────────────────────────────
+ *  Total: 33 bytes
+ */
+#define BLE_PKT_SIZE 33
+
+typedef struct __attribute__((packed)) {
+    uint8_t  header[3];        /* 0xAA 0xAA 0xAA                    */
+    uint32_t sample_counter;   /* uint32 – increments each notify   */
+    uint64_t timestamp_us;     /* ESP32 local time in µs            */
+    int16_t  acc[3];           /* raw accel X/Y/Z (±4 g, 0.122 mg/LSB) */
+    int16_t  gyro[3];          /* raw gyro  X/Y/Z (±1000 dps, 35 mdps/LSB) */
+    uint16_t quat[3];          /* qx qy qz as IEEE-754 half-float   */
+} ble_imu_packet_t;
+_Static_assert(sizeof(ble_imu_packet_t) == BLE_PKT_SIZE, "packet must be 33 bytes");
+
+/* Convert float → IEEE 754 half-precision (binary16) stored in uint16 */
+static uint16_t float_to_half(float value)
+{
+    uint32_t f;
+    memcpy(&f, &value, sizeof(f));
+    uint32_t sign     = (f >> 16) & 0x8000;
+    int32_t  exponent = ((f >> 23) & 0xFF) - 127 + 15;
+    uint32_t mantissa = f & 0x007FFFFF;
+
+    if (exponent <= 0)  return (uint16_t)sign;          /* underflow → ±0   */
+    if (exponent >= 31) return (uint16_t)(sign | 0x7C00);/* overflow → ±inf  */
+    return (uint16_t)(sign | (exponent << 10) | (mantissa >> 13));
+}
 
 static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t ble_tx_chr_val_handle;
@@ -74,6 +114,8 @@ static QueueHandle_t drdy_queue;
 static int ble_gap_event(struct ble_gap_event *event, void *arg);
 static void ble_advertise_start(void);
 
+/* GATT read callback – returns a single 33-byte packet with the
+ * latest IMU sample so that a central can also poll via Read.      */
 static int ble_chr_access_cb(uint16_t conn_handle,
                              uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt,
@@ -83,12 +125,23 @@ static int ble_chr_access_cb(uint16_t conn_handle,
     (void)attr_handle;
     (void)arg;
 
-    ble_telemetry_t packet = {
+    uint32_t idx = (sample_index == 0)
+                 ? SAMPLE_BUFFER_SIZE - 1
+                 : sample_index - 1;
+    imu_sample_t *s = &sample_buffer[idx];
+
+    ble_imu_packet_t pkt = {
+        .header = {0xAA, 0xAA, 0xAA},
         .sample_counter = ble_notify_counter,
-        .timestamp_us = (uint64_t)esp_timer_get_time(),
+        .timestamp_us   = (uint64_t)s->timestamp_us,
+        .acc  = { s->raw_acc[0],  s->raw_acc[1],  s->raw_acc[2] },
+        .gyro = { s->raw_gyro[0], s->raw_gyro[1], s->raw_gyro[2] },
+        .quat = { float_to_half(s->q1),
+                  float_to_half(s->q2),
+                  float_to_half(s->q3) },
     };
 
-    int rc = os_mbuf_append(ctxt->om, &packet, sizeof(packet));
+    int rc = os_mbuf_append(ctxt->om, &pkt, sizeof(pkt));
     return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
@@ -109,27 +162,45 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     {0},
 };
 
+/* Notification task – sends a 33-byte Lab3 packet at ~10 Hz
+ * whenever a central has subscribed to the 0xFFF1 characteristic. */
 static void ble_notify_task(void *arg)
 {
     (void)arg;
 
     for (;;) {
-        if (ble_conn_handle != BLE_HS_CONN_HANDLE_NONE && ble_notify_enabled) {
-            ble_telemetry_t packet = {
+        if (ble_conn_handle != BLE_HS_CONN_HANDLE_NONE
+            && ble_notify_enabled
+            && total_samples > 0)
+        {
+            /* Grab the most recently completed sample */
+            uint32_t idx = (sample_index == 0)
+                         ? SAMPLE_BUFFER_SIZE - 1
+                         : sample_index - 1;
+            imu_sample_t *s = &sample_buffer[idx];
+
+            ble_imu_packet_t pkt = {
+                .header = {0xAA, 0xAA, 0xAA},
                 .sample_counter = ++ble_notify_counter,
-                .timestamp_us = (uint64_t)esp_timer_get_time(),
+                .timestamp_us   = (uint64_t)s->timestamp_us,
+                .acc  = { s->raw_acc[0],  s->raw_acc[1],  s->raw_acc[2] },
+                .gyro = { s->raw_gyro[0], s->raw_gyro[1], s->raw_gyro[2] },
+                .quat = { float_to_half(s->q1),
+                          float_to_half(s->q2),
+                          float_to_half(s->q3) },
             };
 
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(&packet, sizeof(packet));
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(&pkt, sizeof(pkt));
             if (om != NULL) {
-                int rc = ble_gatts_notify_custom(ble_conn_handle, ble_tx_chr_val_handle, om);
+                int rc = ble_gatts_notify_custom(ble_conn_handle,
+                                                 ble_tx_chr_val_handle, om);
                 if (rc != 0) {
                     ESP_LOGW(TAG, "Notify failed, rc=%d", rc);
                 }
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(100));   /* ~10 Hz notification rate */
     }
 }
 
@@ -241,6 +312,7 @@ static void ble_host_task(void *param)
 
 static void ble_init(void)
 {
+    /* 1. NVS – required by NimBLE for storing bonding data */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -248,39 +320,27 @@ static void ble_init(void)
     }
     ESP_ERROR_CHECK(err);
 
+    /* 2. Build a unique device name from the BT MAC */
     uint8_t bt_mac[6] = {0};
     ESP_ERROR_CHECK(esp_read_mac(bt_mac, ESP_MAC_BT));
     snprintf(ble_device_name, sizeof(ble_device_name),
              "Lab3-%02X%02X", bt_mac[4], bt_mac[5]);
 
-    err = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_bt_controller_mem_release failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    err = esp_bt_controller_init(&bt_cfg);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_bt_controller_init failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    err = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_bt_controller_enable failed: %s", esp_err_to_name(err));
-        return;
-    }
-
-    err = esp_nimble_hci_init();
+    /* 3. nimble_port_init() handles controller init, HCI init, and
+     *    NimBLE host init all in one call (ESP-IDF >= v5.0).
+     *    Do NOT call esp_bt_controller_init/enable or esp_nimble_hci_init
+     *    manually – that causes the "controller init failed" crash. */
+    err = nimble_port_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_nimble_hci_init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(err));
         return;
     }
-    nimble_port_init();
+    ESP_LOGI(TAG, "NimBLE port initialised OK");
 
+    /* 4. Configure NimBLE host */
     ble_hs_cfg.sync_cb = ble_on_sync;
 
+    /* 5. Register GAP / GATT services */
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ESP_ERROR_CHECK(ble_svc_gap_device_name_set(ble_device_name));
@@ -290,8 +350,11 @@ static void ble_init(void)
     rc = ble_gatts_add_svcs(gatt_svcs);
     ESP_ERROR_CHECK((rc == 0) ? ESP_OK : ESP_FAIL);
 
+    /* 6. Start NimBLE host task + notification task */
     nimble_port_freertos_init(ble_host_task);
     xTaskCreate(ble_notify_task, "ble_notify_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "BLE init complete – device name: %s", ble_device_name);
 }
 
 static int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp, uint16_t len)
@@ -447,6 +510,9 @@ static void imu_task(void *arg) {
                 sample->ax = ax_mg * MG_TO_MS2;
                 sample->ay = ay_mg * MG_TO_MS2;
                 sample->az = az_mg * MG_TO_MS2;
+                sample->raw_acc[0] = raw_acc[0];
+                sample->raw_acc[1] = raw_acc[1];
+                sample->raw_acc[2] = raw_acc[2];
             }
             
             // Read gyroscope
@@ -458,6 +524,9 @@ static void imu_task(void *arg) {
                 sample->gx = gx_mdps / 1000.0f;
                 sample->gy = gy_mdps / 1000.0f;
                 sample->gz = gz_mdps / 1000.0f;
+                sample->raw_gyro[0] = raw_gyro[0];
+                sample->raw_gyro[1] = raw_gyro[1];
+                sample->raw_gyro[2] = raw_gyro[2];
             }
             
             // Try to read SFLP quaternion from FIFO
