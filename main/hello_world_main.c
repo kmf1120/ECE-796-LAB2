@@ -3,6 +3,33 @@
 // uses concepts called services and characteristics to communicate data. Services are collections of characteristics, and characteristics are individual data points or attributes that can be read, written, or subscribed to for notifications.
 // look at slides, need to condigure CCCD?
 
+/*
+CCCD client characteristic configuration descriptor,
+2 byte value attached to a characteristic, phone writes to it to
+tell the server to start sending notifications or stop
+
+central - ble device that scans and initiates connections (phone)
+
+HCI host controller interface, 
+standardized protocol between BLE host (NimBLE, handles GAP, GATT, security)
+and controller (radio hardware, handles RF, link layer timing)
+they exchange commands events and packets over HCI
+nimble_port_init() sets this up internally
+
+app_main() → ble_init()
+                ├── nimble_port_init()
+                ├── Register gatt_svcs[] (service 0xFFF0, char 0xFFF1)
+                ├── nimble_port_freertos_init(ble_host_task)
+                └── xTaskCreate(ble_notify_task)
+                         │
+              ble_on_sync() ← called when stack ready
+                └── ble_advertise_start()
+                         │
+              ble_gap_event() ← phone connects/disconnects/subscribes
+                         │
+              ble_chr_access_cb() ← phone reads characteristic
+              ble_notify_task()   ← pushes data every 100ms
+*/
 
 #include "sdkconfig.h"
 #include <stdio.h>
@@ -121,6 +148,12 @@ static int ble_chr_access_cb(uint16_t conn_handle,
                              struct ble_gatt_access_ctxt *ctxt,
                              void *arg)
 {
+    /*
+    the GATT read callback when a central issues a read request
+    grabs most recent sample from circular buffer
+    packs into 33 byte packet (formatted)
+    appends packet to response mbuf
+    */
     (void)conn_handle;
     (void)attr_handle;
     (void)arg;
@@ -147,6 +180,9 @@ static int ble_chr_access_cb(uint16_t conn_handle,
 
 static const struct ble_gatt_svc_def gatt_svcs[] = {
     {
+        /*
+        GATT service table that defines data structured ovber BLE
+        */
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = BLE_UUID16_DECLARE(0xFFF0),
         .characteristics = (struct ble_gatt_chr_def[]) {
@@ -162,50 +198,43 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     {0},
 };
 
-/* Notification task – sends a 33-byte Lab3 packet at ~10 Hz
- * whenever a central has subscribed to the 0xFFF1 characteristic. */
-static void ble_notify_task(void *arg)
+/* Send a BLE notification for the given sample.
+ * Called from imu_task at 120 Hz so every sample is transmitted. */
+static void ble_send_sample(imu_sample_t *s)
 {
-    (void)arg;
+    if (ble_conn_handle == BLE_HS_CONN_HANDLE_NONE
+        || !ble_notify_enabled) {
+        return;
+    }
 
-    for (;;) {
-        if (ble_conn_handle != BLE_HS_CONN_HANDLE_NONE
-            && ble_notify_enabled
-            && total_samples > 0)
-        {
-            /* Grab the most recently completed sample */
-            uint32_t idx = (sample_index == 0)
-                         ? SAMPLE_BUFFER_SIZE - 1
-                         : sample_index - 1;
-            imu_sample_t *s = &sample_buffer[idx];
+    ble_imu_packet_t pkt = {
+        .header = {0xAA, 0xAA, 0xAA},
+        .sample_counter = ++ble_notify_counter,
+        .timestamp_us   = (uint64_t)s->timestamp_us,
+        .acc  = { s->raw_acc[0],  s->raw_acc[1],  s->raw_acc[2] },
+        .gyro = { s->raw_gyro[0], s->raw_gyro[1], s->raw_gyro[2] },
+        .quat = { float_to_half(s->q1),
+                  float_to_half(s->q2),
+                  float_to_half(s->q3) },
+    };
 
-            ble_imu_packet_t pkt = {
-                .header = {0xAA, 0xAA, 0xAA},
-                .sample_counter = ++ble_notify_counter,
-                .timestamp_us   = (uint64_t)s->timestamp_us,
-                .acc  = { s->raw_acc[0],  s->raw_acc[1],  s->raw_acc[2] },
-                .gyro = { s->raw_gyro[0], s->raw_gyro[1], s->raw_gyro[2] },
-                .quat = { float_to_half(s->q1),
-                          float_to_half(s->q2),
-                          float_to_half(s->q3) },
-            };
-
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(&pkt, sizeof(pkt));
-            if (om != NULL) {
-                int rc = ble_gatts_notify_custom(ble_conn_handle,
-                                                 ble_tx_chr_val_handle, om);
-                if (rc != 0) {
-                    ESP_LOGW(TAG, "Notify failed, rc=%d", rc);
-                }
-            }
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(&pkt, sizeof(pkt));
+    if (om != NULL) {
+        int rc = ble_gatts_notify_custom(ble_conn_handle,
+                                         ble_tx_chr_val_handle, om);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "Notify failed, rc=%d", rc);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(100));   /* ~10 Hz notification rate */
     }
 }
 
 static void ble_on_sync(void)
 {
+    /*
+    determines ble address
+    logs device ble mac address
+    calls ble_advertise_start() to start advertising
+    */
     uint8_t addr_val[6] = {0};
     int rc = ble_hs_id_infer_auto(0, &ble_addr_type);
     if (rc != 0) {
@@ -230,6 +259,12 @@ static void ble_on_sync(void)
 
 static int ble_gap_event(struct ble_gap_event *event, void *arg)
 {
+    /*
+    CONNECT - stores connection handle, on failure restarts advertising
+    DISCONNECT - clears connection handle, restarts advertising
+    SUBSCRIBE - detects when a central writes to CCCD, sets ble_notify_enabled accordingly
+    ADV_COMPLETE - restarts advertising, handles timeouts
+    */
     (void)arg;
 
     switch (event->type) {
@@ -269,6 +304,12 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 
 static void ble_advertise_start(void)
 {
+    /*
+    builds the advertising data: device name, service UUID 0xFFF0, and flags
+    and flags
+    sets advertising parameters: undirected connectable, general discoverable
+    // starts advertising indefinitely
+    */
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
 
@@ -305,6 +346,11 @@ static void ble_advertise_start(void)
 
 static void ble_host_task(void *param)
 {
+    /*
+    runs nimble_port_run()
+    processes HCI events, gatt operations, and gap events internally
+    task never returns when ble is active
+    */
     (void)param;
     nimble_port_run();
     nimble_port_freertos_deinit();
@@ -312,7 +358,17 @@ static void ble_host_task(void *param)
 
 static void ble_init(void)
 {
+    /*
+    initializes NVS flash, which nimble needs for storing bonding data
+    reads BT MAC address to build unique device name
+    calls nimble_port_init() to set up the BLE controller and host stack
+    sets sync callback ble_on_sync, so advertising begins once the stack is ready
+    registers GAP and GATT services/characteristics
+    starts nimble host task and notification task
+    */
+
     /* 1. NVS – required by NimBLE for storing bonding data */
+    // (saves keys after pairing so they can reconnect easily)
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -341,8 +397,8 @@ static void ble_init(void)
     ble_hs_cfg.sync_cb = ble_on_sync;
 
     /* 5. Register GAP / GATT services */
-    ble_svc_gap_init();
-    ble_svc_gatt_init();
+    ble_svc_gap_init();  //profile: advertising scanning connecting bonding
+    ble_svc_gatt_init();  // attributre: defines services. the service contains the characteristic
     ESP_ERROR_CHECK(ble_svc_gap_device_name_set(ble_device_name));
 
     int rc = ble_gatts_count_cfg(gatt_svcs);
@@ -350,9 +406,8 @@ static void ble_init(void)
     rc = ble_gatts_add_svcs(gatt_svcs);
     ESP_ERROR_CHECK((rc == 0) ? ESP_OK : ESP_FAIL);
 
-    /* 6. Start NimBLE host task + notification task */
+    /* 6. Start NimBLE host task (notifications sent from imu_task) */
     nimble_port_freertos_init(ble_host_task);
-    xTaskCreate(ble_notify_task, "ble_notify_task", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "BLE init complete – device name: %s", ble_device_name);
 }
@@ -570,6 +625,9 @@ static void imu_task(void *arg) {
             // Convert quaternion to Euler angles
             quaternion_to_euler(sample->q0, sample->q1, sample->q2, sample->q3,
                               &sample->roll, &sample->pitch, &sample->yaw);
+
+            // Send this sample over BLE immediately (120 Hz)
+            ble_send_sample(sample);
             
             // Update counters
             total_samples++;
@@ -654,6 +712,8 @@ static void i2c_scan(i2c_port_t i2c_num)
     ESP_LOGI(TAG, "I2C scan complete. Found %d device(s).\n", found);
 }
 
+
+
 void app_main(void) {
     ESP_LOGI(TAG, "╔═══════════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║   LSM6DSV16X IMU - 120Hz Collection, 1Hz Display     ║");
@@ -661,7 +721,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "║   FIXED: Proper Euler Angle Conversion               ║");
     ESP_LOGI(TAG, "╚═══════════════════════════════════════════════════════╝\n");
 
-    ble_init();
+    ble_init();  // initializes the ble stack and starts advertising
 
     // I2C configuration
     const i2c_port_t I2C_NUM = I2C_NUM_0;
@@ -713,7 +773,7 @@ void app_main(void) {
     
     ESP_LOGI(TAG, "✓ LSM6DSV16X detected (WHO_AM_I = 0x%02x)\n", whoamI);
 
-    // Perform software reset
+    // Perform software reset, clear states
     ESP_LOGI(TAG, "Performing software reset...");
     if (lsm6dsv16x_sw_reset(&dev_ctx) != 0) {
         ESP_LOGE(TAG, "Failed to reset device");
